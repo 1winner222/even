@@ -1,0 +1,38 @@
+name: signal
+
+on:
+  schedule:
+    # 每 15 分钟一次（UTC 时间；北京时间 = UTC+8）
+    - cron: "*/15 * * * *"
+  workflow_dispatch:        # 也支持在网页上手动点一下立刻跑
+
+permissions:
+  contents: write           # 需要写权限，用来把去重状态提交回仓库
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 扫描信号并推送
+        env:
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+        run: python cloud_signal.py
+
+      - name: 提交去重状态（避免重复推送）
+        run: |
+          if [ -n "$(git status --porcelain signal_state.json)" ]; then
+            git config user.name  "signal-bot"
+            git config user.email "signal-bot@users.noreply.github.com"
+            git add signal_state.json
+            git commit -m "chore: update signal state [skip ci]"
+            git push
+          else
+            echo "状态无变化"
+          fi
