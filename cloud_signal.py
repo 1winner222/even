@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -27,6 +29,15 @@ MIN_SPACE, MAX_SPACE = 30, 20
 FLAT_GAP = 12.0            # 振幅不足 -> 困盘，不提醒
 STATE_FILE = "signal_state.json"
 WEBHOOK = os.environ.get("WECOM_WEBHOOK", "").strip()
+
+# ---- 收盘盘点 ----
+# 云端不读手机上的 config.json，所以休市日与推送时间写在这里，改的时候两边都要改。
+MARKET_CLOSED = ("2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04",
+                 "2026-10-05", "2026-10-06", "2026-10-07")
+BRIEF_HOUR, BRIEF_MINUTE, BRIEF_WINDOW_MIN = 15, 0, 20
+# 盘点的"今天推过了没"直接记在 signal_state.json 里（键名前缀 __brief__），
+# 这样云端工作流不需要改，本来就提交这个文件。
+BRIEF_KEY = "__brief__"
 
 _ACTIONABLE = {"做空开仓", "空单平仓", "做多开仓", "多单持仓", "全平多单",
                "半平多单", "放弃开空", "反手开空", "观察开空",
@@ -194,6 +205,40 @@ def signals(bars):
     return [x if isinstance(x, tuple) else (x,) for x in out]
 
 
+PRODUCT_ZH = {"SA": "纯碱", "FG": "玻璃", "RM": "菜粕", "UR": "尿素",
+              "SM": "锰硅", "C": "玉米", "CS": "淀粉", "HC": "热卷",
+              "RB": "螺纹", "M": "豆粕", "V": "PVC", "TA": "PTA"}
+
+_TITLE_EMOJI = (
+    ("下穿前低", "\U0001FA78"), ("上穿前高", "\U0001F680"),
+    ("反手开空", "\U0001F504"), ("做空开仓", "\u2b07\ufe0f"),
+    ("做多开仓", "\u2b06\ufe0f"), ("空单平仓", "\U0001F6D1"),
+    ("全平多单", "\u26a0\ufe0f"), ("半平多单", "\u2702\ufe0f"),
+    ("多单持仓", "\U0001F402"), ("放弃开空", "\U0001F914"),
+    ("观察开空", "\U0001F440"),
+)
+_FALLBACK_EMOJI = ("\U0001F40B", "\U0001F30A", "\U0001F3A3", "\U0001F9ED",
+                   "\U0001F4E1", "\U0001F52D", "\u2693", "\U0001F3AF")
+
+
+def product_zh(symbol):
+    key = "".join(ch for ch in str(symbol).upper() if ch.isalpha())
+    return PRODUCT_ZH.get(key, str(symbol))
+
+
+def title_emoji(kind, seed=""):
+    for key, emo in _TITLE_EMOJI:
+        if key in kind:
+            return emo
+    h = sum(ord(c) for c in f"{kind}{seed}")
+    return _FALLBACK_EMOJI[h % len(_FALLBACK_EMOJI)]
+
+
+def title_for(product, code, timeframe, kind, seed=""):
+    return (f"{title_emoji(kind, seed)}【{product_zh(product)} "
+            f"{code} {timeframe}】{kind}")
+
+
 def tail_phrase(kind, seed=""):
     T = {
         "down": ["黑云压城城欲摧", "山雨欲来风满楼", "风萧萧兮易水寒", "铁骑突出刀枪鸣"],
@@ -275,16 +320,20 @@ def push(title, body):
         return False
     payload = json.dumps({"msgtype": "markdown",
                           "markdown": {"content": f"**{title}**\n{body}"[:4000]}}).encode()
-    req = urllib.request.Request(WEBHOOK, data=payload,
-                                 headers={"Content-Type": "application/json"})
-    try:
-        r = urllib.request.urlopen(req, timeout=10)
-        ok = '"errcode":0' in r.read().decode("utf-8", "replace")
-        print(f"  推送 {title} -> {'成功' if ok else '失败'}")
-        return ok
-    except Exception as e:  # noqa: BLE001
-        print(f"  推送失败: {e}")
-        return False
+    # 同一条连发两次（与本地一致）
+    ok_any = False
+    for n in range(1):   # 只发一次
+        try:
+            req = urllib.request.Request(WEBHOOK, data=payload,
+                                         headers={"Content-Type": "application/json"})
+            r = urllib.request.urlopen(req, timeout=10)
+            if '"errcode":0' in r.read().decode("utf-8", "replace"):
+                ok_any = True
+        except Exception as e:  # noqa: BLE001
+            print(f"  推送第{n+1}次失败: {e}")
+        time.sleep(5)      # 两条之间隔 5 秒
+    print(f"  推送 {title} -> {'成功' if ok_any else '失败'}")
+    return ok_any
 
 
 def is_flat(bars):
@@ -292,12 +341,365 @@ def is_flat(bars):
     return (max(b["high"] for b in w) - min(b["low"] for b in w)) < FLAT_GAP
 
 
+# ---------------- 收盘盘点 ----------------
+# ---- 新闻筛选口径（用户 2026-10-01 定，与本地一致）----
+# 只认①供需端异动 ②政府政策异动；上下游联动与宏观一律不进。
+SUPPLY_DEMAND = (
+    "检修", "停产", "减产", "增产", "限产", "产能", "装置", "开工", "产量",
+    "库存", "累库", "去库", "补库", "进口", "出口", "关税", "需求", "订单",
+    "产销", "开工率", "复产", "事故", "爆炸", "安全",
+)
+POLICY = (
+    "政策", "环保", "能耗双控", "限电", "调控", "国常会", "发改委", "工信部",
+    "生态环境部", "反倾销", "退税", "督察", "安监", "标准", "补贴", "规划",
+)
+BULLISH = ("检修", "停产", "限产", "减产", "去库", "库存下降", "环保限产",
+           "能耗双控", "限电", "事故", "爆炸", "出口增加", "需求回暖")
+BEARISH = ("增产", "复产", "产能投放", "累库", "库存增加", "库存上升",
+           "需求走弱", "需求疲弱", "进口增加", "开工回升", "供应宽松")
+TOPICS = (
+    ("检修", "装置检修"), ("停产", "停车"), ("限产", "限产"), ("减产", "减产"),
+    ("增产", "增产"), ("复产", "复产"), ("产能", "产能变动"), ("开工", "开工率"),
+    ("库存", "库存"), ("累库", "累库"), ("去库", "去库"), ("进口", "进口"),
+    ("出口", "出口"), ("关税", "关税"), ("需求", "需求"), ("订单", "订单"),
+    ("产销", "产销率"), ("环保", "环保"), ("能耗双控", "能耗双控"),
+    ("限电", "限电"), ("政策", "政件"), ("发改委", "发改委"),
+    ("工信部", "工信部"), ("事故", "事故"), ("安全", "安监"),
+)
+
+
+def is_trading_day():
+    n = now_cn()
+    if n.weekday() >= 5:
+        return False
+    return n.strftime("%Y-%m-%d") not in MARKET_CLOSED
+
+
+def _idx(bars, i):
+    """把默认的负下标转成正下标。
+
+    这里踩过坑：写成 bars[max(0, i-1)]，i=-1 时会取到 bars[0]，
+    等于拿最后一根和最早一根比；而 ap = bars[i-1] if i >= 1 else None
+    在 i=-1 时直接变成 None，判断永远走"走平"分支。
+    """
+    return i if i >= 0 else len(bars) + i
+
+
+def _ma_words(bars, i=-1):
+    i = _idx(bars, i)
+    c, p = bars[i], bars[i - 1] if i >= 1 else bars[i]
+    m9, m25, m69 = c.get("MA9"), c.get("MA25"), c.get("MA69")
+    if None in (m9, m25, m69):
+        return ""
+    s = ("三线多头排列" if m9 > m25 > m69 else
+         "三线空头排列" if m9 < m25 < m69 else "三线交织")
+    if None not in (p.get("MA9"), p.get("MA25")):
+        if p["MA9"] < p["MA25"] and m9 > m25:
+            s += "，MA9 刚上穿 MA25"
+        elif p["MA9"] > p["MA25"] and m9 < m25:
+            s += "，MA9 刚下穿 MA25"
+    return s
+
+
+def _macd_words(bars, i=-1):
+    i = _idx(bars, i)
+    c, p = bars[i], bars[i - 1] if i >= 1 else bars[i]
+    dif, dea = c.get("DIF"), c.get("DEA")
+    if None in (dif, dea):
+        return ""
+    z = ("零轴上方" if dif > 0 and dea > 0 else
+         "零轴下方" if dif < 0 and dea < 0 else "跨零轴")
+    if None not in (p.get("DIF"), p.get("DEA")):
+        if p["DIF"] <= p["DEA"] and dif > dea:
+            z += "，刚金叉"
+        elif p["DIF"] >= p["DEA"] and dif < dea:
+            z += "，刚死叉"
+    return f"MACD {z}"
+
+
+def _adx_words(bars, i=-1):
+    i = _idx(bars, i)
+    a = bars[i].get("ADX")
+    if a is None:
+        return ""
+    ap = bars[i - 1].get("ADX") if i >= 1 else None
+    d = "上行" if ap and a > ap + 0.05 else ("回落" if ap and a < ap - 0.05 else "走平")
+    pdi, mdi = bars[i].get("PDI"), bars[i].get("MDI")
+    if None not in (pdi, mdi):
+        d += "，" + ("+DI 占优" if pdi > mdi else "−DI 占优")
+    return f"ADX {d}"
+
+
+def _fetch_news(limit=30):
+    import json as _json
+    out = []
+    for url, ref in (
+        ("https://news.10jqka.com.cn/tapp/news/push/stock/", "https://news.10jqka.com.cn"),
+        (f"https://zhibo.sina.com.cn/api/zhibo/feed?page=1&page_size={limit}&zhibo_id=152",
+         "https://finance.sina.com.cn"),
+        (f"https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2516&num={limit}&page=1",
+         "https://finance.sina.com.cn"),
+    ):
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0", "Referer": ref})
+            d = _json.loads(urllib.request.urlopen(req, timeout=12).read().decode("utf-8", "replace"))
+            if "10jqka" in url:
+                out += [(x.get("title") or "") + " " + (x.get("digest") or "")
+                        for x in d.get("data", {}).get("list", []) or []]
+            elif "zhibo" in url:
+                out += [str(x.get("rich_text") or x.get("text") or "")
+                        for x in d.get("result", {}).get("data", {}).get("feed", {}).get("list", [])]
+            else:
+                out += [str(x.get("title") or "") for x in d.get("result", {}).get("data", [])]
+        except Exception as e:  # noqa: BLE001
+            print(f"  新闻源失败 {url[:32]}: {str(e)[:40]}")
+    return [t for t in out if t]
+
+
+def news_brief():
+    """只陈述供需与政策异动，不搬原文，不做上下游推演。空仓时只看能开仓的品种。"""
+    try:
+        titles = _fetch_news()
+    except Exception as e:  # noqa: BLE001
+        print(f"  新闻抓取失败 {e}")
+        return "　抓取失败"
+    if not titles:
+        return "　暂无可用报道"
+    # 云端不读手机持仓；默认按"能开仓"口径，即两个监控品种里波动够的那个
+    scope = []
+    for prod, code in PRODUCTS.items():
+        try:
+            d15 = prep(closed_only(fetch_bars(code, 15), 15))
+            if len(d15) < 12:
+                continue
+            w = d15[-12:]
+            hi = max(b["high"] for b in w); lo = min(b["low"] for b in w)
+            if hi - lo >= 12:
+                scope.append(prod)
+        except Exception:  # noqa: BLE001
+            pass
+    if not scope:
+        scope = list(PRODUCTS)
+    lines = []
+    for prod in scope:
+        zh = product_zh(prod)
+        hit = [t for t in titles
+               if zh in t and any(k in t for k in SUPPLY_DEMAND + POLICY)]
+        if not hit:
+            lines.append(f"　{zh}（可开仓）　无驱动型大事件及政件")
+            continue
+        j = " ".join(hit)
+        tp = [lb for kw, lb in TOPICS if kw in j][:5]
+        bull = sum(1 for k in BULLISH if k in j)
+        bear = sum(1 for k in BEARISH if k in j)
+        tone = ("供应收缩方向，短期偏多" if bull > bear else
+                "供应宽松或需求走弱，短期偏空" if bear > bull else
+                "供需两向都有说法，方向未定")
+        if any(k in j for k in POLICY):
+            tone += "；含政件，留意执行力度"
+        lines.append(f"　{zh}（可开仓）　{len(hit)} 条，涉及"
+                     f"{'、'.join(tp) if tp else '相关异动'} → {tone}")
+    return "\n".join(lines) if lines else "　无驱动型大事件及政件"
+
+
+# ---- 现货价（生意社基差页，取"现货价格"列）----
+SPOT_UNIT = {"SA": "元/吨", "FG": "元/平方米"}
+_SPOT = {}
+
+
+def closed_only(bars, minutes):
+    """只保留已经收线的 K 线。
+
+    云端拿的是全量，最后一根常常是正在走的那根；本地一直只用已收线的。
+    两边口径必须一致，否则同一时刻会给出不同的趋势描述。
+    """
+    if not bars:
+        return bars
+    cutoff = now_cn() - timedelta(minutes=minutes)
+    return [b for b in bars if b["dt"] <= cutoff] or bars
+
+
+def _shape(bars):
+    """是震荡整理还是趋势推进：三线走平 + 反复缠绕 = 震荡（与本地同口径）。"""
+    if len(bars) < 62:
+        return "数据不足"
+    win = bars[-60:]
+    trs = []
+    for i in range(1, len(bars)):
+        h, l, pc = bars[i]["high"], bars[i]["low"], bars[i - 1]["close"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    a = sum(trs[-14:]) / 14 if trs else 0
+    if a <= 0:
+        return "数据不足"
+    limit = a * 0.12
+    slopes = []
+    for k in ("MA9", "MA25", "MA69"):
+        vals = [b[k] for b in win if b.get(k) is not None]
+        if len(vals) < 5:
+            return "数据不足"
+        slopes.append((vals[-1] - vals[0]) / (len(vals) - 1))
+    flat = max(abs(v) for v in slopes) <= limit
+    cross = 0
+    for p, q in zip(win, win[1:]):
+        if None in (p.get("MA9"), p.get("MA25"), q.get("MA9"), q.get("MA25")):
+            continue
+        if (p["MA9"] - p["MA25"]) * (q["MA9"] - q["MA25"]) < 0:
+            cross += 1
+    return "震荡整理" if (flat and cross >= 2) else "趋势推进中"
+
+
+def spot_price(prod):
+    if prod in _SPOT:
+        return _SPOT[prod]
+    zh = product_zh(prod)
+    val = None
+    try:
+        req = urllib.request.Request("https://www.100ppi.com/sf/", headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Referer": "https://www.100ppi.com"})
+        raw = urllib.request.urlopen(req, timeout=15).read().decode("utf-8", "replace")
+        raw = raw.replace("&nbsp;", " ")
+        txt = re.sub(r"<script.*?</script>", "", raw, flags=re.S)
+        txt = re.sub(r"<style.*?</style>", "", txt, flags=re.S)
+        txt = re.sub(r"<[^>]+>", "\n", txt)
+        lines = [l.strip() for l in txt.split("\n") if l.strip()]
+        for i, l in enumerate(lines):
+            if l == zh or l.startswith(zh):
+                for nxt in lines[i + 1:i + 6]:
+                    m = re.match(r"^([0-9]+(?:\.[0-9]+)?)$", nxt.strip())
+                    if m:
+                        val = float(m.group(1))
+                        break
+                break
+    except Exception as e:  # noqa: BLE001
+        print(f"  现货价抓取失败（{zh}）: {str(e)[:50]}")
+    _SPOT[prod] = val
+    return val
+
+
+# ---- 末尾随机句（用户提供）----
+CLOSING_TAGS = (
+    "沉没成本不参与重大决策", "承兑附加条件视为拒承兑", "保持怀疑，独立性高于一切",
+    "一切皆有可能，但是依然要怀疑一切", "利益之所在，风险之所在",
+    "权力只对权力的来源负责", "外在言行，皆为内心映射",
+    "人只会为自身利益权衡取舍",
+    "没投资过你人生的人，就没讨好的资格，更没平等对待的义务",
+    "出钱的有话语权，出力的有建议权，而我有决策权", "做时间的朋友，",
+    "艹，地球online的金币也太难获取了，", "开整   ， 开整", "快开饭了，宝贝",
+    "又活过了一天。", "牛逼坏了现在，这也能行  !", "行吧， 静能生慧",
+    "💰稳可周全💰", "大肥鱼🐟的生活也并非一帆风顺",
+)
+TAGS_KEY = "__tags__"
+FW = "\u3000"
+
+
+def _w(text):
+    return sum(2 if ord(c) > 0x2E80 else 1 for c in text)
+
+
+def _center(text, width):
+    pad = max(0, width - _w(text))
+    left = (pad // 2) // 2 * 2
+    right = pad - left
+    return FW * (left // 2) + text + FW * (right // 2) + (" " if right % 2 else "")
+
+
+def closing_tag(state):
+    """每次只发一句，顺序随机，19 句跑完一轮才重来。"""
+    import random
+    used = [i for i in (state.get(TAGS_KEY) or [])
+            if isinstance(i, int) and 0 <= i < len(CLOSING_TAGS)]
+    pool = [i for i in range(len(CLOSING_TAGS)) if i not in used]
+    if not pool:
+        pool = list(range(len(CLOSING_TAGS)))
+        used = []
+    idx = random.choice(pool)
+    used.append(idx)
+    state[TAGS_KEY] = used
+    line = "-  " + CLOSING_TAGS[idx] + "  -"
+    width = max(_w("-  " + t + "  -") for t in CLOSING_TAGS)
+    return _center(line, width)
+
+
+def compose_brief(state):
+    n = now_cn()
+    wd = "一二三四五六日"[n.weekday()]
+    out = [f"\U0001F4CA **{n:%m-%d} \u5468{wd}**", ""]
+    for prod, code in PRODUCTS.items():
+        try:
+            d4 = prep(closed_only(fetch_bars(code, 240), 240))
+            d60 = prep(closed_only(fetch_bars(code, 60), 60))
+            if len(d4) < 30:
+                continue
+            out.append(f"**{product_zh(prod)} {code}**")
+            # 今日趋势：标签独占一行，内容另起一行缩进六字
+            out.append("\u3000今日趋势")
+            segs = [_ma_words(d4), _macd_words(d4), _adx_words(d4)]
+            p60 = _ma_words(d60) if len(d60) > 2 else ""
+            if p60:
+                segs.append(f"60分{p60}")
+            out.append("\u3000\u3000\u3000\u3000\u3000\u3000"
+                       + "；".join([x for x in segs if x]))
+            wk = d4[-10:]
+            wo, wc = wk[0]["open"], wk[-1]["close"]
+            chg = (wc - wo) / wo * 100 if wo else 0
+            tone = "上行" if chg > 0.5 else ("下行" if chg < -0.5 else "横向")
+            hi = max(b["high"] for b in wk)
+            lo = min(b["low"] for b in wk)
+            shape = _shape(d4)
+            out.append(f"\u3000本周趋势\u3000本周{tone} {abs(chg):.1f}%，"
+                       f"周内 {lo:.0f}~{hi:.0f}，{shape}")
+            sp = spot_price(prod)
+            unit = SPOT_UNIT.get(prod, "元/吨")
+            sp_txt = f"{sp:g} {unit}" if isinstance(sp, (int, float)) else "—（未取到）"
+            out.append(f"\u3000现货收盘 {sp_txt}\u3000期货收盘 {d4[-1]['close']:.0f}")
+            out.append("")
+        except Exception as e:  # noqa: BLE001
+            out.append(f"\u3000{prod} 取数失败：{str(e)[:50]}")
+            out.append("")
+    out.append("**消息面**")
+    out.append(news_brief())
+    out.append("")
+    out.append(closing_tag(state))
+    return "\n".join(out)
+
+
+def brief_due(state):
+    if not is_trading_day():
+        return False
+    n = now_cn()
+    cur = n.hour * 60 + n.minute
+    tgt = BRIEF_HOUR * 60 + BRIEF_MINUTE
+    if not (tgt <= cur <= tgt + BRIEF_WINDOW_MIN):
+        return False
+    return state.get("last") != n.strftime("%Y-%m-%d")
+
+
 def main():
     try:
         state = json.load(open(STATE_FILE, encoding="utf-8"))
     except Exception:  # noqa: BLE001
         state = {}
+    # ---- 收盘盘点：交易日 15:00 推一条，休市一律不推 ----
+    bstate = state.get(BRIEF_KEY) or {}
+    if brief_due(bstate):
+        print("  到收盘盘点时间，开始生成")
+        body = compose_brief(state)
+        push("收盘盘点", body)
+        bstate["last"] = now_cn().strftime("%Y-%m-%d")
+        state[BRIEF_KEY] = bstate
+        changed = True
+        print("  盘点状态已并入 signal_state.json")
+    elif not is_trading_day():
+        print(f"  今日休市（{now_cn():%Y-%m-%d}），收盘盘点静默")
     changed = False
+    if not is_trading_day():
+        print(f"  今日休市（{now_cn():%Y-%m-%d}），不扫描信号")
+        if changed:
+            json.dump(state, open(STATE_FILE, "w", encoding="utf-8"),
+                      ensure_ascii=False, indent=1)
+        return 0
     for prod, code in PRODUCTS.items():
         for period, label in ((240, "4小时"), (60, "60分")):
             try:
@@ -323,7 +725,7 @@ def main():
                     continue
                 state[key] = now_cn().strftime("%Y-%m-%d %H:%M:%S")
                 changed = True
-                push(f"【{code} {label}】{k}",
+                push(title_for(prod, code, label, k, bar),
                      describe(bars, k) + "\n\n" + tail_phrase(k, bar))
     if len(state) > 400:
         for k in sorted(state)[:len(state) - 400]:
