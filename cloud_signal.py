@@ -235,8 +235,13 @@ def title_emoji(kind, seed=""):
 
 
 def title_for(product, code, timeframe, kind, seed=""):
+    """标题带 K 线时间 —— 去重按 K 线记，带上时间才分得清是新的一次还是延续。"""
+    hm = ""
+    m = re.search(r"(\d{1,2}:\d{2})", str(seed))
+    if m:
+        hm = " " + m.group(1)
     return (f"{title_emoji(kind, seed)}【{product_zh(product)} "
-            f"{code} {timeframe}】{kind}")
+            f"{code} {timeframe}{hm}】{kind}")
 
 
 def tail_phrase(kind, seed=""):
