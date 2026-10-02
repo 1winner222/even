@@ -317,7 +317,8 @@ def describe(bars, kind, i=-1):
         ap = bars[i - 1]["ADX"]
         d = ("ADX上行" if ap and cur["ADX"] > ap + 0.05 else
              "ADX回落" if ap and cur["ADX"] < ap - 0.05 else "ADX走平")
-        dmi_s = f"｜{d}，{'+DI占优' if cur['PDI'] > cur['MDI'] else '−DI占优'}"
+        dmi_s = (f"｜{d}，" + ("+DI占优" if cur["PDI"] > cur["MDI"]
+                             else ("−DI占优" if cur["MDI"] > cur["PDI"] else "两方均衡")))
     w = bars[max(0, i - 19):i + 1]
     sup = min(b["low"] for b in w)
     res = max(b["high"] for b in w)
@@ -452,7 +453,8 @@ def _adx_words(bars, i=-1):
     d = "上行" if ap and a > ap + 0.05 else ("回落" if ap and a < ap - 0.05 else "走平")
     pdi, mdi = bars[i].get("PDI"), bars[i].get("MDI")
     if None not in (pdi, mdi):
-        d += "，" + ("+DI 占优" if pdi > mdi else "−DI 占优")
+        d += "，" + ("+DI 占优" if pdi > mdi
+                   else ("−DI 占优" if mdi > pdi else "两方均衡"))
     return f"ADX {d}"
 
 
