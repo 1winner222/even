@@ -893,6 +893,11 @@ def news_brief():
 
 # ---- 现货价(生意社基差页,取"现货价格"列)----
 SPOT_UNIT = {"SA": "元/吨", "FG": "元/平方米"}
+# 玻璃换算系数:1 吨 = 87 平方米。
+# 不是教科书的 80(5mm x 2500kg/m3 = 12.5kg/m2 -> 80 m2/吨)——
+# 实际交割的板有公差、密度也不同。2026-10-04 用我的钢铁网的沙河行情原文
+# 反推:10.75 元/平方米 = 935 元/吨 -> 87.0;10.70 元/平方米 = 930 元/吨 -> 86.9。
+SQM_PER_TON = 87.0
 _SPOT = {}
 
 
@@ -935,6 +940,44 @@ def _shape(bars):
         if (p["MA9"] - p["MA25"]) * (q["MA9"] - q["MA25"]) < 0:
             cross += 1
     return "震荡整理" if (flat and cross >= 2) else "趋势推进中"
+
+
+SHAH_LIST = "https://www.mysteel.com/oilchem/bolizq/"
+_SHAH = {}
+
+
+def shah_glass():
+    """沙河浮法玻璃现货价(我的钢铁网每日行情).返回 (元/吨, 元/平方米).
+
+    同花顺 App 里那个 935 用的就是沙河(玻璃的交割基准地),生意社给的是
+    全国均价(12.15 元/平方米),折出来永远和 App 差一截。用户 2026-10-04
+    拍板改用这个源。取不到返回 (None, None),调用方退回生意社。
+    """
+    if "v" in _SHAH:
+        return _SHAH["v"]
+    ton = sqm = None
+    try:
+        raw = _get(SHAH_LIST, referer="https://www.mysteel.com/", encoding="utf-8")
+        url = None
+        for a, title in re.findall(
+                r'href="([^"]+/a/\d+/[0-9A-F]+\.html)"[^>]*>([^<]{4,90})', raw):
+            if "沙河" in title and "浮法玻璃" in title:
+                url = a if a.startswith("http") else "https:" + a
+                break
+        if url:
+            page = _get(url, referer=SHAH_LIST, encoding="utf-8")
+            txt = re.sub(r"<script.*?</script>", "", page, flags=re.S)
+            txt = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", txt))
+            m = re.search(r"合计\s*([0-9]+(?:\.[0-9]+)?)\s*元/吨", txt)
+            if m:
+                ton = float(m.group(1))
+            m2 = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*元/平方米", txt)
+            if m2:
+                sqm = float(m2.group(1))
+    except Exception as e:  # noqa: BLE001
+        print("  沙河现货抓取失败:%s" % str(e)[:50])
+    _SHAH["v"] = (ton, sqm)
+    return ton, sqm
 
 
 def spot_price(prod):
@@ -1138,10 +1181,31 @@ def compose_brief(state):
             shape = _shape(d4)
             out.append(f"  本周趋势  本周{tone} {abs(chg):.1f}%,"
                        f"周内 {lo:.0f}~{hi:.0f},{shape}")
-            sp = spot_price(prod)
-            unit = SPOT_UNIT.get(prod, "元/吨")
-            sp_txt = f"{sp:g} {unit}" if isinstance(sp, (int, float)) else "-(未取到)"
-            out.append(f"  现货收盘 {sp_txt}  期货收盘 {d4[-1]['close']:.0f}")
+            sp_ton = None
+            sp_txt = "-(未取到)"
+            # 玻璃优先用沙河(交割基准地,与同花顺 App 同口径);
+            # 取不到才退回生意社全国均价,那时才需要乘 87 折算。
+            if prod == "FG":
+                ton, sqm = shah_glass()
+                if ton:
+                    # A 方案(用户 2026-10-04):只报沙河的吨价,和期货同单位、能和 App 对上
+                    sp_ton = ton
+                    sp_txt = f"{ton:g} 元/吨(沙河)"
+            if sp_ton is None:
+                sp = spot_price(prod)
+                unit = SPOT_UNIT.get(prod, "元/吨")
+                if isinstance(sp, (int, float)):
+                    sp_txt = f"{sp:g} {unit}"
+                    # 纯碱本来就是 元/吨,与生意社页面口径一致。
+                    if unit == "元/平方米":
+                        sp_ton = sp * SQM_PER_TON
+                        sp_txt += f"(折 {sp_ton:g} 元/吨)"
+                    else:
+                        sp_ton = float(sp)
+            close_px = d4[-1]["close"]
+            # 基差 = 现货 - 期货(升水为正)
+            basis = f"  基差 {sp_ton - close_px:+.0f}" if sp_ton is not None else ""
+            out.append(f"  现货收盘 {sp_txt}  期货收盘 {close_px:.0f}{basis}")
             out.append("")
         except Exception as e:  # noqa: BLE001
             out.append(f"  {prod} 取数失败:{str(e)[:50]}")
