@@ -407,60 +407,6 @@ def worth_acting(bars, kind, i=-1):
     return sp >= 20                    # 与 describe 里 grade() 的 20 点门槛一致
 
 
-def tail_phrase(kind, seed="", worth=None):
-    """结尾的一句话.worth=False(正文判了"不值得动手")时,
-    开仓类不能再用[进]那一组,否则一条消息自相矛盾(用户 2026-10-04 指出)."""
-    T = {
-        "down": [
-            "黑云压城城欲摧",
-            "山雨欲来风满楼",
-            "风萧萧兮易水寒",
-            "铁骑突出刀枪鸣",
-        ],
-        "up": [
-            "大风起兮云飞扬",
-            "长风破浪会有时",
-            "扶摇直上九万里",
-            "星河欲转千帆舞",
-        ],
-        "enter": [
-            "三线开花缓缓[进]",
-            "量起势成稳稳[进]",
-            "风生水起大步[进]",
-            "雾散云开轻轻[进]",
-            "东风已至扬帆[进]",
-            "热热闹闹一块[进]",
-        ],
-        "exit": [
-            "丝粘线乱趁早[离]",
-            "月满则亏从容[退]",
-            "云散风停慢慢[收]",
-            "浪过礁石静静[离]",
-            "花开茶凉缓缓[走]",
-            "拍拍屁股快快[溜]",
-        ],
-        "watch": [
-            "线缠丝绕且慢[等]",
-            "风未起时静静[守]",
-            "雾里看花慢慢[观]",
-            "潮未到时且自[歇]",
-            "乖乖坐好别乱[动]",
-            "稳住别慌慢慢[等]",
-        ],
-    }
-    if kind == "下穿前低":
-        g = T["down"]
-    elif kind == "上穿前高":
-        g = T["up"]
-    elif kind in ("做空开仓", "做多开仓", "反手开空"):
-        g = T["watch"] if worth is False else T["enter"]
-    elif kind in ("空单平仓", "全平多单", "半平多单"):
-        g = T["exit"]
-    else:
-        g = T["watch"]
-    return g[sum(ord(ch) for ch in kind + seed) % len(g)]
-
-
 def ma_state(bars, i=-1):
     """均线排列的一句话(共振行用).与本地 sa_strategy.ma_state 同口径."""
     if not bars:
@@ -487,14 +433,15 @@ def resonance_line(d4, d60, d15):
     1 小时与 4 小时不同向时标出"⚠️ 1H共振方向有变".
     """
     s4, s60, s15 = ma_state(d4), ma_state(d60), ma_state(d15)
+    _short = {"三线空头": "空", "三线多头": "多", "均线交织": "织"}
     segs = []
     if s4:
-        segs.append(f"4小时 {s4}")
+        segs.append(f"4小时 {_short.get(s4, s4)}")
     if s60:
-        segs.append(f"1小时 {s60}" +
+        segs.append(f"1小时 {_short.get(s60, s60)}" +
                     (" ⚠️ 1H共振方向有变" if (s4 and s60 != s4) else ""))
     if s15:
-        segs.append(f"15分钟 {s15}")
+        segs.append(f"15分钟 {_short.get(s15, s15)}")
     if not segs:
         return ""
     return "共振   " + " | ".join(segs)
@@ -750,7 +697,7 @@ def flow_words(vol_word, oi_word):
     # 这一行只留解释,而且用长版 —— 他原话:把放量减仓四个字删掉,人话换成长的。
     table = {
         (1, 1): "新钱进场接盘,趋势容易延续下去",
-        (1, -1): "旧钱在离场,价格是被平仓推着走的,不是新钱推的",
+        (1, -1): "旧钱在离场,价格被平仓推着走,不是新钱推的",
         (1, 0): "成交放量但持仓没动,只是换手,不是新钱进场",
         (-1, 1): "只有少量资金在试单,没人真下重手",
         (-1, -1): "参与的人在变少,多空都在观望",
@@ -762,8 +709,117 @@ def flow_words(vol_word, oi_word):
     return table.get((v, h), "")
 
 
+# ================= 跨周期总结行（用户 2026-10-04 定，与本地 sa_strategy 同算法）=================
+# 主句用【4小时】定调（均线排列 + DI/ADX 的走向），副句用【1小时】说"短线在干什么"。
+# 用"收手/加码"不说"力量"，免得和上面 ADX 那行的"下跌力量在变强"打架。
+STATE_BULL = 1
+STATE_BEAR = -1
+STATE_MIX = 0
+
+
+def _ma_state(bars, i=-1):
+    s = ma_state(bars, i)
+    return {u"三线多头": STATE_BULL, u"三线空头": STATE_BEAR}.get(s, STATE_MIX)
+
+
+def _di_pair(bars, i=-1):
+    if bars is None:
+        return None, None
+    try:
+        adx, pdi, mdi = dmi(bars)
+        if i < 0:
+            i = len(bars) + i
+        return pdi[i], mdi[i]
+    except Exception as e:  # noqa: BLE001
+        print("  总结行 _di_pair 失败:%s" % str(e)[:50])
+        return None, None
+
+
+def _moves(bars, i=-1):
+    """返回 (pdi_move, mdi_move, adx_move),各 1 在进 / -1 在退 / 0 看不出来。
+
+    只取【走向】不取绝对值，所以 4 小时那 5.2 的 ADX 偏差不影响判断。
+    """
+    try:
+        adx, pdi, mdi = dmi(bars)
+        if i < 0:
+            i = len(bars) + i
+        p, m = pdi[i], mdi[i]
+        pp, pm = pdi[i - 1], mdi[i - 1]
+        a, pa = adx[i], adx[i - 1]
+        if None in (p, m, pp, pm):
+            return 0, 0, 0
+        def _sgn(d):
+            return 1 if d > 0.5 else (-1 if d < -0.5 else 0)
+        return _sgn(p - pp), _sgn(m - pm), _sgn(a - pa)
+    except Exception as e:  # noqa: BLE001
+        print("  总结行 _moves 失败:%s" % str(e)[:50])
+        return 0, 0, 0
+
+
+def summary_line(bars_4h, bars_60m, i=-1, live=True):
+    if not live:
+        return ""
+    st4 = _ma_state(bars_4h, i)
+    pdi4, mdi4, adx4 = _moves(bars_4h, i) if bars_4h is not None else (0, 0, 0)
+    st1 = _ma_state(bars_60m, i) if bars_60m is not None else STATE_MIX
+    if st4 == STATE_BEAR:
+        if mdi4 < 0 and adx4 < 0:
+            head = "空头在收手，跌势在散"
+        elif mdi4 < 0 and adx4 > 0:
+            head = "空头在收手，但跌势还在加速"
+        elif mdi4 < 0:
+            head = "空头在收手"
+        elif mdi4 > 0 and adx4 > 0:
+            head = "空头在加码，跌势在加速"
+        elif mdi4 > 0 and adx4 < 0:
+            head = "空头在加码，但跌势在减速"
+        elif mdi4 > 0:
+            head = "空头在加码"
+        else:
+            head = "空头占着位"
+    elif st4 == STATE_BULL:
+        if pdi4 < 0 and adx4 < 0:
+            head = "多头在收手，涨势在散"
+        elif pdi4 < 0 and adx4 > 0:
+            head = "多头在收手，但涨势还在加速"
+        elif pdi4 < 0:
+            head = "多头在收手"
+        elif pdi4 > 0 and adx4 > 0:
+            head = "多头在加码，涨势在加速"
+        elif pdi4 > 0 and adx4 < 0:
+            head = "多头在加码，但涨势在减速"
+        elif pdi4 > 0:
+            head = "多头在加码"
+        else:
+            head = "多头占着位"
+    else:
+        head = "方向还没挑明，多空在这儿对着磨"
+    # 副句：先看 1小时自己的 DI 有没有翻（那才是"短线在干什么"的正主）。
+    pdi1, mdi1 = _di_pair(bars_60m, i)
+    st1_side = 0
+    if pdi1 is not None and mdi1 is not None and pdi1 != mdi1:
+        st1_side = STATE_BULL if pdi1 > mdi1 else STATE_BEAR
+    if st4 != STATE_MIX and st1_side and st1_side != st4:
+        sub = ("小周期已经翻多了 —— 短线在反抗" if st1_side == STATE_BULL
+               else "小周期已经翻空了 —— 短线先撤")
+    elif st1 != st4 and st1 != STATE_MIX:
+        sub = ("小周期均线翻多 —— 短线在反抗" if st1 == STATE_BULL
+               else "小周期均线翻空 —— 短线先撤")
+    elif st1 == STATE_MIX and st4 != STATE_MIX:
+        sub = "小周期走平了 —— 短线还没跟上"
+    elif st1 == st4 and st4 != STATE_MIX:
+        sub = "小周期跟着同向 —— 短线跟得住"
+    else:
+        sub = ""
+    if sub:
+        return head + "；\n" + sub.replace(" —— ", "，") + "。"
+    return head + "。"
+
+
 def describe(bars, kind, i=-1, reso=None, sub_lines=None, vol_text="",
-             oi_text="", range_text="", tf_mark="", live=True):
+             oi_text="", range_text="", tf_mark="", live=True, df_60m=None,
+             summary_4h=None):
     if i < 0:
         i = len(bars) + i      # 负数下标必须先转正,否则下面切片算出来是空列表
     cur, prev = bars[i], bars[i - 1]
@@ -840,7 +896,17 @@ def describe(bars, kind, i=-1, reso=None, sub_lines=None, vol_text="",
     else:
         _sw = sub_words(bars, i)
         subs = _rows(_sw) if _sw else []
-    out_lines = [first] + subs + [sp, last]
+    out_lines = [first] + subs
+    # 跨周期总结行(用户 2026-10-04 定):副图下面、空间行上面,另起一行。
+    try:
+        _h4 = summary_4h if summary_4h is not None else bars
+        _sum = summary_line(_h4, df_60m, i=-1, live=live)
+    except Exception as e:  # noqa: BLE001
+        _sum = ""
+        print("  总结行失败:%s" % str(e)[:50])
+    if _sum:
+        out_lines.append(_sum)
+    out_lines += [sp, last]
     # 人话那句:休市不显示(那时成交是按 K 线比出来的假信号)。
     # 顶到第一格,不留缩进 —— 与本地一致。
     if flow and live:
@@ -1266,8 +1332,51 @@ def _center(text, width):
     return FW * (left // 2) + text + FW * (right // 2) + (" " if right % 2 else "")
 
 
+_BREAK = "，,。;；、！？!?"
+
+
+def _split_fit(text, max_w=42):
+    """超宽文本在标点处拆成多行,每行 <= max_w 格。不超宽原样返回。
+
+    只在标点处断(优先),找不到标点才退到空格,都不行才按宽度硬断。
+    断点处的尾随空格去掉。与本地 closing_brief._split_fit 同算法。
+    """
+    if _w(text) <= max_w:
+        return [text]
+    half = len(text) // 2
+    best = -1
+    best_d = None
+    for ch_set in (_BREAK, " "):
+        for i, ch in enumerate(text):
+            if ch in ch_set:
+                d = abs(i - half)
+                if best_d is None or d < best_d:
+                    best_d = d
+                    best = i
+        if best >= 0:
+            break
+    if best < 0:
+        acc = 0
+        cut = 0
+        for i, ch in enumerate(text):
+            acc += 2 if ord(ch) > 0x2E80 else 1
+            if acc > max_w:
+                cut = i
+                break
+        if not cut:
+            return [text]
+        return [text[:cut]] + _split_fit(text[cut:], max_w)
+    left = text[:best + 1].rstrip()
+    right = text[best + 1:].lstrip()
+    return _split_fit(left, max_w) + _split_fit(right, max_w)
+
+
 def closing_tag(state):
-    """每次只发一句,顺序随机,19 句跑完一轮才重来."""
+    """每次只发一句,顺序随机,19 句跑完一轮才重来.
+
+    2026-10-04 用户为适配企业微信一行宽度(18 中字+3 标点=42 格):
+    超宽尾句在标点处拆两行,每行居中到 42 格;短句一行居中到 42 格。
+    """
     import random
     used = [i for i in (state.get(TAGS_KEY) or [])
             if isinstance(i, int) and 0 <= i < len(CLOSING_TAGS)]
@@ -1280,8 +1389,8 @@ def closing_tag(state):
     state[TAGS_KEY] = used
     tag = CLOSING_TAGS[idx]
     line = _wrap(tag)                      # 长句不加短横
-    width = max(_w(_wrap(t)) for t in CLOSING_TAGS)
-    return _center(line, width)
+    rows = _split_fit(line, 42)
+    return "\n".join(_center(r, 42) for r in rows)
 
 
 
@@ -1327,8 +1436,15 @@ def compose_brief(state):
             hi = max(b["high"] for b in wk)
             lo = min(b["low"] for b in wk)
             shape = _shape(d4)
-            out.append(f"  本周趋势  本周{tone} {abs(chg):.1f}%,"
-                       f"周内 {lo:.0f}~{hi:.0f},{shape}")
+            _wt = f"本周{tone} {abs(chg):.1f}%,周内 {lo:.0f}~{hi:.0f},{shape}"
+            _wt_full = f"  本周趋势  {_wt}"
+            if _w(_wt_full) > 42:
+                _wt_rows = _split_fit(_wt, 42 - _w("  本周趋势  "))
+                out.append("  本周趋势  " + _wt_rows[0])
+                for _p in _wt_rows[1:]:
+                    out.append("           " + _p)
+            else:
+                out.append(_wt_full)
             sp_ton = None
             sp_txt = "-(未取到)"
             # 玻璃优先用沙河(交割基准地,与同花顺 App 同口径);
@@ -1353,7 +1469,15 @@ def compose_brief(state):
             close_px = d4[-1]["close"]
             # 基差 = 现货 - 期货(升水为正)
             basis = f"  基差 {sp_ton - close_px:+.0f}" if sp_ton is not None else ""
-            out.append(f"  现货收盘 {sp_txt}  期货收盘 {close_px:.0f}{basis}")
+            _pl = f"现货收盘 {sp_txt}  期货收盘 {close_px:.0f}{basis}"
+            _pl_full = f"  {_pl}"
+            if _w(_pl_full) > 42:
+                _pl_rows = _split_fit(_pl, 42 - _w("  "))
+                out.append("  " + _pl_rows[0])
+                for _p in _pl_rows[1:]:
+                    out.append("           " + _p)
+            else:
+                out.append(_pl_full)
             out.append("")
         except Exception as e:  # noqa: BLE001
             out.append(f"  {prod} 取数失败:{str(e)[:50]}")
@@ -1377,6 +1501,10 @@ def brief_due(state):
 
 
 def main():
+    changed = False        # 状态要不要写回. 原来只在"盘点推出去了"或"扫到新信号"
+                           # 时才赋值, 于是没信号又没过盘点时间的那一轮走到最后
+                           # 会 UnboundLocalError(实测: 除盘点/新信号外每轮都崩).
+                           # 放在最前面给初值, 这个坑就不会再出现.
     try:
         state = json.load(open(STATE_FILE, encoding="utf-8"))
     except Exception:  # noqa: BLE001
@@ -1393,7 +1521,6 @@ def main():
         print("  盘点状态已并入 signal_state.json")
     elif not is_trading_day():
         print(f"  今日休市({now_cn():%Y-%m-%d}),收盘盘点静默")
-    changed = False
     if not is_trading_day():
         print(f"  今日休市({now_cn():%Y-%m-%d}),不扫描信号")
         if changed:
@@ -1468,8 +1595,8 @@ def main():
                               vol_text=vol_text, oi_text=oi_text,
                               range_text=range_text,
                               tf_mark=("4H" if period == 240 else "1H"),
-                              live=live) + "\n\n"
-                     + tail_phrase(k, bar, worth=worth_acting(bars, k)))
+                              live=live, df_60m=p3.get(60),
+                              summary_4h=p3.get(240)))
     if len(state) > 400:
         for k in sorted(state)[:len(state) - 400]:
             state.pop(k, None)
