@@ -121,7 +121,13 @@ def macd(v, f=12, s=26, sig=9):
     return dif, dea
 
 
-def dmi(bars, n=14):
+def dmi(bars, n=9, adx_n=8):
+    """DMI(9,8) + 简单平均 —— 与本地 futures_signal.compute_indicators 同一套。
+
+    参数照用户 App 的副图设置(2026-10-04):他的 60分 ADX 24.87,
+    本函数算出 24.76(差 0.11);旧的 Wilder(14) 只有 11.6(差 13)。
+    返回 (adx, pdi, mdi)。
+    """
     L = len(bars)
     pdi = [None] * L
     mdi = [None] * L
@@ -136,25 +142,22 @@ def dmi(bars, n=14):
         mdm[i] = dn if (dn > up and dn > 0) else 0.0
     if L <= n:
         return adx, pdi, mdi
-    atr = sum(tr[1:n + 1]) / n
-    ap, am = sum(pdm[1:n + 1]) / n, sum(mdm[1:n + 1]) / n
-    dxs = []
-    for i in range(n + 1, L):
-        atr = (atr * (n - 1) + tr[i]) / n
-        ap = (ap * (n - 1) + pdm[i]) / n
-        am = (am * (n - 1) + mdm[i]) / n
-        p = 100 * ap / atr if atr else 0
-        m = 100 * am / atr if atr else 0
+    dx = [None] * L
+    for i in range(n, L):
+        s_tr = sum(tr[i - n + 1:i + 1])
+        s_p = sum(pdm[i - n + 1:i + 1])
+        s_m = sum(mdm[i - n + 1:i + 1])
+        if not s_tr:
+            continue
+        p = 100.0 * s_p / s_tr
+        m = 100.0 * s_m / s_tr
         pdi[i], mdi[i] = p, m
-        dxs.append(100 * abs(p - m) / (p + m) if (p + m) else 0)
-    if len(dxs) >= n:
-        a = sum(dxs[:n]) / n
-        adx[n + n] = a
-        for k, dx in enumerate(dxs[n:]):
-            a = (a * (n - 1) + dx) / n
-            i = n + n + k + 1
-            if i < L:
-                adx[i] = a
+        dx[i] = 100.0 * abs(p - m) / (p + m) if (p + m) else 0.0
+    valid = [i for i in range(L) if dx[i] is not None]
+    if len(valid) >= adx_n:
+        for k in range(adx_n - 1, len(valid)):
+            adx[valid[k]] = sum(
+                dx[i] for i in valid[k - adx_n + 1:k + 1]) / adx_n
     return adx, pdi, mdi
 
 
@@ -192,6 +195,7 @@ def rsi_words(bars, i=-1, pdi=None, mdi=None):
         空头占优 + RSI 上行 -> 空头动能下跌   (空头占优但空头在减弱 = 反弹)
         空头占优 + RSI 下行 -> 空头动能上升
     不写数值,只写文字(用户要求副图只用文字描述).
+    2026-10-04 追加:前面带上指标名和数值(RSI 38.7 空头动能上升),旧的作废。
     """
     try:
         r = RSI([b["close"] for b in bars])
@@ -203,11 +207,17 @@ def rsi_words(bars, i=-1, pdi=None, mdi=None):
         rsi_up = True if d > RSI_FLAT else (False if d < -RSI_FLAT else None)
         if pdi is not None and mdi is not None and pdi != mdi:
             bull = pdi > mdi
-            verb = ("走平" if rsi_up is None else
-                    "上升" if (bull == rsi_up) else "下跌")
-            return ("多头动能" if bull else "空头动能") + verb
-        return "动能" + ("回升" if rsi_up else
-                        "回落" if rsi_up is False else "走平")
+            side = "多头" if bull else "空头"
+            if rsi_up is None:
+                tail = "占优,动能走平"
+            elif bull == rsi_up:
+                tail = "既占优又在增强"
+            else:
+                tail = "占优但在减弱(%s)" % ("回调" if bull else "反弹")
+            # 用户 2026-10-04:要完整一句说明白的,与本地逐字一致。
+            return "RSI %.1f %s%s" % (r[i], side, tail)
+        return "RSI %.1f 动能%s" % (r[i], "在增强" if rsi_up else
+                                    "在减弱" if rsi_up is False else "走平")
     except Exception as exc:  # noqa: BLE001
         # 兜底必须留痕,否则 bug 被吞成"看着正常"(用户定的规矩)
         print(f"[rsi_words 兜底] {type(exc).__name__}: {exc}")
@@ -215,26 +225,35 @@ def rsi_words(bars, i=-1, pdi=None, mdi=None):
 
 
 ADX_FLAT = 0.05                # ADX 变化死区,与本地一致
+# ADX 低于这个数 = 还没有趋势(用户 2026-10-04 拍板):
+# ADX 13.7 说"跌势在升温"是硬凑。方向不丢:共振行与今日趋势第一词都写着三线多空。
+ADX_NO_TREND = 20.0
 
 
 def adx_phrase(adx_now, adx_prev=None, pdi=None, mdi=None):
-    """ADX + DMI 合成一句:涨势/跌势 + 在升温/在降温/走平.与本地同口径."""
+    """ADX + DMI 合成一句:ADX 13.7 跌势在升温 / ADX 13.7 还没有趋势.与本地同口径."""
     if adx_now is None:
         return ""
     if pdi is not None and mdi is not None:
         if mdi > pdi:
-            subj = "跌势"
+            subj = "下跌力量"
         elif pdi > mdi:
-            subj = "涨势"
+            subj = "上涨力量"
         else:
-            return "多空僵持"
+            return "ADX %.1f 多空力量相当,方向不明" % adx_now
     else:
-        subj = "趋势"
+        subj = "力量"
+    # 用户 2026-10-04:ADX 后面也接一句人话(和 RSI 那行同款),要的是"翻译"。
+    if adx_now < ADX_NO_TREND:
+        return "ADX %.1f 还没有趋势,来回磨" % adx_now
     if adx_prev is None:
-        return subj
+        return "ADX %.1f %s" % (adx_now, subj)
     d = adx_now - adx_prev
-    return subj + ("在升温" if d > ADX_FLAT else
-                   "在降温" if d < -ADX_FLAT else "走平")
+    if d > ADX_FLAT:
+        return "ADX %.1f %s在变强,趋势在加速" % (adx_now, subj)
+    if d < -ADX_FLAT:
+        return "ADX %.1f %s在变弱,趋势在减速" % (adx_now, subj)
+    return "ADX %.1f %s持平,趋势没变" % (adx_now, subj)
 
 
 def prep(bars):
@@ -313,9 +332,11 @@ def title_emoji(kind, seed=""):
 # 开仓类的标题只留一个字(用户 2026-10-04),前面加警示符让它在消息列表里跳出来
 _TITLE_SHORT = {"做多开仓": "\u26a0\ufe0f多", "做空开仓": "\u26a0\ufe0f空"}
 
-
 def title_for(product, code, timeframe, kind, seed=""):
-    """标题带 K 线时间 -- 去重按 K 线记,带上时间才分得清是新的一次还是延续."""
+    """标题带 K 线时间 -- 去重按 K 线记,带上时间才分得清是新的一次还是延续。
+
+    触发周期的标记不在这里(用户说"不是标题"),放在正文最后一行前面。
+    """
     hm = ""
     m = re.search(r"(\d{1,2}:\d{2})", str(seed))
     if m:
@@ -479,7 +500,7 @@ def resonance_line(d4, d60, d15):
     return "共振   " + " | ".join(segs)
 
 
-def sub_words(bars, i=-1):
+def sub_words(bars, i=-1, with_adx=True):
     """副图三样合成一句:MACD零轴/交叉 | RSI+DI | ADX+DI.与本地同口径.
 
     抽出来是因为用户 2026-10-04 要求 4小时 和 1小时 各出一行,各自标周期,
@@ -502,7 +523,9 @@ def sub_words(bars, i=-1):
         elif prev["DIF"] >= prev["DEA"] and dif < dea:
             pos += "刚死叉"
     dmi_s = ""
-    if None not in (cur.get("ADX"), cur.get("PDI"), cur.get("MDI")):
+    # 用户 2026-10-04 选 C 方案:ADX 只报 1 小时那行(那组和 App 差 0.11),
+    # 4 小时那行不报(差 5.2,约 9% 的时段会两边互相打脸)。与本地逐字一致。
+    if with_adx and None not in (cur.get("ADX"), cur.get("PDI"), cur.get("MDI")):
         ap = bars[i - 1].get("ADX") if i >= 1 else None
         _t = adx_phrase(cur["ADX"], ap, cur["PDI"], cur["MDI"])
         if _t:
@@ -512,7 +535,10 @@ def sub_words(bars, i=-1):
 
 
 VOL_STUB_RATIO = 0.10      # 兜底:量不足前几根中位数 10% -> 认作坏根
-VOL_CUTOFF_HM = (14, 40)   # 用户 2026-10-04 定:14:40 之后那几根的量不算
+# 用户 2026-10-04:收盘那几根的量不能用(短线集中平仓,数据是废的)。
+# 一天 【两次】收盘:日盘 15:00、夜盘 23:00,只跳这两处,
+# 别把夜盘的 21:00/22:00 也跳掉 —— 那两根是好根(我第一版就写宽了)。
+VOL_BAD_WINDOWS = (((14, 40), (15, 30)), ((22, 40), (23, 30)))
 
 
 def real_bar_index(bars, i=-1, lookback=5, ratio=VOL_STUB_RATIO):
@@ -529,7 +555,10 @@ def real_bar_index(bars, i=-1, lookback=5, ratio=VOL_STUB_RATIO):
         return i
     while i >= lookback:
         dt = bars[i].get("dt")
-        if dt is None or (dt.hour, dt.minute) < VOL_CUTOFF_HM:
+        if dt is None:
+            break
+        hm = (dt.hour, dt.minute)
+        if not any(lo <= hm <= hi for lo, hi in VOL_BAD_WINDOWS):
             break
         i -= 1
     if i < lookback:
@@ -551,11 +580,22 @@ def volume_word(bars, i=-1):
     avg = sum(prior) / len(prior) if prior else 0
     if not avg:
         return ""
-    if v >= avg * 1.2:
-        return "成交在增"
-    if v <= avg * 0.8:
-        return "成交在减"
-    return "成交持平"
+    # 用户 2026-10-04 选 C:成交不只有"增/减",还要看【速度】——
+    # 倍数越高说明动得越猛,暴增那档通常就是大钱/大单在扫。
+    k = v / avg
+    if k >= 2.0:
+        return "成交暴增"
+    if k >= 1.5:
+        return "成交明显增"
+    if k >= 1.2:
+        return "成交微增"
+    if k > 0.8:
+        return "成交持平"
+    if k > 0.6:
+        return "成交微减"
+    if k > 0.4:
+        return "成交明显减"
+    return "成交暴减"
 
 
 def fetch_cum_volume(code):
@@ -638,7 +678,92 @@ def oi_line(bars, i=-1):
     return f"{word} {delta:+,.0f}({wan:.1f}万)"
 
 
-def describe(bars, kind, i=-1, reso=None, sub_lines=None, vol_text=""):
+def range_state(bars, i=-1):
+    """振幅状态一句话。与本地 sa_strategy.range_state 同口径、同阈值。
+
+    用户 2026-10-04:这一句固定用【4小时】数据算(调用方传 range_text 进来),
+    60分钟触发时也报 4 小时的振幅,不跟触发周期走。25 点以上 = 激战。
+    """
+    if i < 0:
+        i = len(bars) + i
+    win = bars[max(0, i - 5):i + 1]
+    if not win:
+        return ""
+    rng = max(b["high"] for b in win) - min(b["low"] for b in win)
+    if rng < 5:
+        return "动能睡着啦,盘面困住不动"
+    if rng < FLAT_GAP:
+        return "来回十来点,横盘震荡"
+    if rng < 25:
+        return "波动正常,还在区间里磨"
+    return "波动剧烈,多空正在激战"
+
+
+def range_line(bars, i=-1):
+    """振幅那一行(带数值)。与本地 sa_strategy.range_line 逐字一致。"""
+    if i < 0:
+        i = len(bars) + i
+    win = bars[max(0, i - 5):i + 1]
+    if not win:
+        return ""
+    rng = max(b["high"] for b in win) - min(b["low"] for b in win)
+    return "振幅 %.0f 点,%s" % (rng, range_state(bars, i))
+
+
+SESSIONS = [("21:00", "23:00"), ("09:00", "10:15"),
+            ("10:30", "11:30"), ("13:30", "15:00")]
+
+
+def is_trading_time(dt):
+    """北京时间 dt 是否在盘中(不考虑节假日)。与本地 futures_signal 同款。
+
+    用途:休市时"成交"那句是按 K 线比出来的假信号,所以不显示后面的人话。
+    """
+    if dt.weekday() >= 5:
+        return False
+    hm = dt.strftime("%H:%M")
+    return any(a <= hm <= b for a, b in SESSIONS)
+
+
+def flow_words(vol_word, oi_word):
+    """成交 + 持仓 合成一句人话(用户 2026-10-04 总结并拍板).与本地逐字一致.
+
+    九种说法都照"新钱进场"那个力度写 —— 用户原话:"新钱进场多直接"。
+    这一句替换掉原来的振幅那句(波动剧烈,多空正在激战)。
+    """
+    # 成交的用词分了七档(成交暴增/明显增/微增/持平/微减/明显减/暴减),
+    # 判方向时先看"持平",再减、再增 —— 否则"暴减"会被"减"以外的规则漏掉。
+    def _dir(w):
+        if not w or "持平" in w:
+            return 0
+        if "减" in w:
+            return -1
+        if "增" in w:
+            return 1
+        return 0
+
+    v = _dir(vol_word)
+    h = _dir(oi_word)
+    # 九种全写"术语 + 大白话翻译"(用户 2026-10-04:专业行话还得翻译)。
+    # 句子长了,所以这一句在正文里单独占一行(缩进对齐到成交那半句)。
+    # 用户 2026-10-04:术语不重复(上一行已经写了"成交在增|持仓在减"),
+    # 这一行只留解释,而且用长版 —— 他原话:把放量减仓四个字删掉,人话换成长的。
+    table = {
+        (1, 1): "新钱进场接盘,趋势容易延续下去",
+        (1, -1): "旧钱在离场,价格是被平仓推着走的,不是新钱推的",
+        (1, 0): "成交放量但持仓没动,只是换手,不是新钱进场",
+        (-1, 1): "只有少量资金在试单,没人真下重手",
+        (-1, -1): "参与的人在变少,多空都在观望",
+        (-1, 0): "成交缩了持仓也没动,双方都在等",
+        (0, 1): "成交平平但持仓在增,有新仓悄悄进来",
+        (0, -1): "成交平平但持仓在减,有老仓悄悄离场",
+        (0, 0): "成交和持仓都没动,没人动手,盘面安静",
+    }
+    return table.get((v, h), "")
+
+
+def describe(bars, kind, i=-1, reso=None, sub_lines=None, vol_text="",
+             oi_text="", range_text="", tf_mark="", live=True):
     if i < 0:
         i = len(bars) + i      # 负数下标必须先转正,否则下面切片算出来是空列表
     cur, prev = bars[i], bars[i - 1]
@@ -684,26 +809,46 @@ def describe(bars, kind, i=-1, reso=None, sub_lines=None, vol_text=""):
         right = ("上方历史最高位,无参照" if res is None else
                  f"前高{res:.0f}(差{up:.0f},多单{grade(up)})")
         sp = left + "|" + right
-    avg6 = max(b["high"] for b in bars[i - 5:i + 1]) - min(b["low"] for b in bars[i - 5:i + 1])
-    rng = ("动能睡着啦,盘面困住不动" if avg6 < 5 else
-           "来回十来点,横盘震荡" if avg6 < FLAT_GAP else
-           # 原来写"方向还没挑明",与第 1 行的三线排列自相矛盾 -- 改成只说振幅.
-           # 2026-10-04 用户改:25 点以上就算激战(原来 35,设高了).
-           "波动正常,还在区间里磨" if avg6 < 25 else "波动剧烈,多空正在激战")
+    # 振幅:调用方传了 4 小时口径的就用它(用户 2026-10-04 定),没传才自己算。
+    rng = range_text or range_state(bars, i)
     # 给了共振行就用共振(4小时/1小时/15分同不同向一眼看出),量能并到第 4 行;
     # 没给就回退成原来的单周期写法.与本地 brief_compact 完全一致.
     first = reso if reso else f"{ma}|{vs}"
     # 第 4 行:量能 | 4小时持仓量变化 | 振幅状态(与本地完全一致)
-    _oi = oi_line(bars, i)
-    tail_bits = [vs] + ([_oi] if _oi else []) + [rng]
+    _oi = oi_text or oi_line(bars, i)
+    # 用户 2026-10-04:最后那半句换成"成交+持仓"的人话解读,不再报振幅。与本地一致。
+    flow = flow_words(vs, _oi)
+    tail_bits = [vs] + ([_oi] if _oi else [])
     last = (" | ".join([x for x in tail_bits if x]) if reso else rng)
+    if tf_mark and last:
+        # 用户 2026-10-04:谁触发的就标谁(4H / 1H),标在这一行开头。与本地一致。
+        last = f"{tf_mark} {last}"
     # 副图段:给了 sub_lines 就一行一个周期(前面自带周期名);没给就自己算一行.
+    # 用户 2026-10-04:那行在手机上会自己折、还断在词中间。RSI 换成完整大白话后
+    # 一行放不下两个指标 -> 拆三行(标签+MACD / RSI / ADX),都缩进对齐到 MACD 起头。
+    def _rows(s):
+        if "|" not in s:
+            return [s]
+        parts = s.split("|")
+        return [parts[0]] + ["      " + x for x in parts[1:]]
+
     if sub_lines:
-        subs = [x for x in sub_lines if x]
+        subs = []
+        for _x in sub_lines:
+            if _x:
+                subs.extend(_rows(_x))
     else:
         _sw = sub_words(bars, i)
-        subs = [_sw] if _sw else []
-    return "\n".join([first] + subs + [sp, last])
+        subs = _rows(_sw) if _sw else []
+    out_lines = [first] + subs + [sp, last]
+    # 人话那句:休市不显示(那时成交是按 K 线比出来的假信号)。
+    # 顶到第一格,不留缩进 —— 与本地一致。
+    if flow and live:
+        out_lines.append(flow)
+    # 振幅单独一行带数值。与本地一致。
+    if rng:
+        out_lines.append("   " + rng)
+    return "\n".join(out_lines)
 
 
 # ---------------- 推送 ----------------
@@ -1155,23 +1300,26 @@ def compose_brief(state):
             out.append(f"**{product_zh(prod)} {code}**")
             # 今日趋势:标签独占一行,内容另起一行缩进六字
             out.append("  今日趋势")
+            # 用户 2026-10-04 选 C 方案:这行是 4 小时口径,不报 ADX(与本地一致)。
             segs = [_ma_words(d4), _macd_words(d4),
                     rsi_words(d4, len(d4) - 1,
-                              pdi=d4[-1].get("PDI"), mdi=d4[-1].get("MDI")),
-                    _adx_words(d4)]
+                              pdi=d4[-1].get("PDI"), mdi=d4[-1].get("MDI"))]
             p60 = _ma_words(d60) if len(d60) > 2 else ""
             if p60:
                 segs.append(f"60分钟{p60}")
-            # 用户 2026-10-04:4 小时那段和"60分..."那段分两行写 ——
-            # 挤一行时末尾的"排列"会被折到下一行去。两行从同一列起,
-            # 这样"三"字正下方就是下一行的"6"字。
-            body = ";".join([x for x in segs if x])
-            tr = body.split(";")
-            if len(tr) > 1 and tr[-1].startswith("60分钟"):
-                out.append("            " + ";".join(tr[:-1]))
-                out.append("            " + tr[-1])
-            else:
-                out.append("            " + body)
+            # 用户 2026-10-04:先按"4小时 / 60分钟"拆两行;后来给 RSI/ADX 加了
+            # 指标名和数值,第 1 行涨到 80 列又会折行 -> 拆三行:
+            # 均线+MACD / RSI+ADX / 60分钟,三行同一列起。与本地逐字一致。
+            seg = [x for x in segs if x]
+            row60 = [x for x in seg if x.startswith("60分")]
+            body = [x for x in seg if not x.startswith("60分")]
+            head = [x for x in body
+                    if not (x.startswith("RSI") or x.startswith("ADX"))]
+            tail = [x for x in body
+                    if x.startswith("RSI") or x.startswith("ADX")]
+            for row in (head, tail, row60):
+                if row:
+                    out.append("            " + ";".join(row))
             wk = d4[-10:]
             wo, wc = wk[0]["open"], wk[-1]["close"]
             chg = (wc - wo) / wo * 100 if wo else 0
@@ -1272,18 +1420,27 @@ def main():
             subs = []
             for lab, per in (("4小时", 240), ("1小时", 60)):
                 if p3.get(per):
-                    w = sub_words(p3[per], -1)
+                    w = sub_words(p3[per], -1, with_adx=True)
                     if w:
                         subs.append(f"{lab} {w}")
         except Exception as e:  # noqa: BLE001
             subs = []
             print(f"  {code} 副图行失败 {e}")
-        # 量比:口径是"这次推送 vs 上次推送",样本记在 signal_state.json 里
+        # 成交口径(用户 2026-10-04 定):开市就比前 5 根,不跟上次推送比。
+        # 坏根按 14:40 截断由 volume_word 处理,所以这里不传 vol_text。
+        vol_text = ""
+        # 休市时成交那句是假的,后面的人话不显示。
+        live = is_trading_time(now_cn())
+        # 用户 2026-10-04:第 4 行的持仓变化和振幅固定用【4小时】口径,
+        # 60分钟触发时也报 4 小时那两句,不跟着触发周期走。与本地一致。
+        oi_text = range_text = ""
         try:
-            vol_text = volume_push_word(state, code)
+            b4 = p3.get(240)
+            if b4:
+                oi_text = oi_line(b4, -1)
+                range_text = range_line(b4, -1)
         except Exception as e:  # noqa: BLE001
-            vol_text = ""
-            print(f"  {code} 量比失败 {e}")
+            print(f"  {code} 4小时口径取数失败 {e}")
         for period, label in ((240, "4小时"), (60, "60分钟")):
             bars = p3.get(period)
             if bars is None:
@@ -1308,7 +1465,10 @@ def main():
                 changed = True
                 push(title_for(prod, code, label, k, bar),
                      describe(bars, k, reso=reso, sub_lines=subs,
-                              vol_text=vol_text) + "\n\n"
+                              vol_text=vol_text, oi_text=oi_text,
+                              range_text=range_text,
+                              tf_mark=("4H" if period == 240 else "1H"),
+                              live=live) + "\n\n"
                      + tail_phrase(k, bar, worth=worth_acting(bars, k)))
     if len(state) > 400:
         for k in sorted(state)[:len(state) - 400]:
